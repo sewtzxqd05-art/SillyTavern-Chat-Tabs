@@ -1,0 +1,13 @@
+node_modules/
+data/
+config.yaml
+settings.json
+secrets.json
+sync-journal.json
+.chat-tabs-backups/
+*.log
+*.zip
+work/
+outputs/
+.DS_Store
+Thumbs.db
