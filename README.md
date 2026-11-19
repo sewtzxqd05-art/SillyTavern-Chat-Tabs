@@ -8,13 +8,44 @@
 
 要求 SillyTavern 1.19.0 或更新版本，本版在 1.19.0 验证。复用酒馆已有的 Node.js 和依赖，无需另装 Python、数据库或额外服务。
 
-### 完整安装包
+### 1. 酒馆前端：在扩展安装框填写哪个网址？
+
+打开酒馆的「扩展 → 安装扩展」（部分界面在「管理扩展」里），粘贴下面的网址并确认安装：
+
+```text
+https://github.com/sewtzxqd05-art/SillyTavern-Chat-Tabs
+```
+
+安装完成后刷新页面。前端可以选择仅当前账号安装或所有账号安装；下面的配套组件命令均适用。完整多开还需要完成第二步。
+
+### 2. 安卓 Termux：下载并安装配套组件
+
+先完成上面的前端安装。等待所有生成和保存结束，在启动酒馆的 Termux 窗口按 `Ctrl+C` 停止酒馆。编辑酒馆目录里的 `config.yaml`，把现有的 `enableServerPlugins` 改为：
+
+```yaml
+enableServerPlugins: true
+```
+
+保存后，在 Termux 粘贴并执行下面整段命令。默认酒馆位于 `$HOME/SillyTavern`；如果位置不同，只替换第一行的目录：
+
+```sh
+cd "$HOME/SillyTavern" &&
+chat_tabs_installer="$(mktemp -d)" &&
+git clone --depth 1 https://github.com/sewtzxqd05-art/SillyTavern-Chat-Tabs.git "$chat_tabs_installer" &&
+sh "$chat_tabs_installer/install.sh" "$PWD" --backend-only
+```
+
+这段命令会把安装器下载到临时目录，再只安装配套组件。若提示 `git: command not found`，先执行 `pkg install git`，再重新执行上面整段命令。
+
+看到 `Installed Chat Tabs 1.3.0 companion only` 后，按平时的方式重新启动酒馆，并刷新所有酒馆页面。从「魔术棒 → 多开聊天」进入，新建窗口和按项同步位于「2 · 多开与配套组件」。
+
+### 完整安装包：可替代上面两步
 
 - Windows：解压后双击「安装.cmd」，选择酒馆实际目录。
 - 安卓 Termux / 自建 Linux 服务器：将包解压，在包目录运行 `sh ./install.sh "你的酒馆目录"`。
 - 完整安装前，酒馆 `config.yaml` 需设为 `enableServerPlugins: true`。等生成和保存结束后，重启酒馆并刷新网页。
 
-### 从酒馆“管理扩展”安装此仓库
+### 已安装前端：也可直接使用随附安装器
 
 仓库根目录含扩展清单，可供扩展管理直接安装。然后在运行酒馆的设备上安装配套组件。无需重新下载另一个项目，可使用扩展里随附的安装脚本。
 
