@@ -1,0 +1,32 @@
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+const host='http://127.0.0.1:18122',base='/api/plugins/chat-tabs',root=path.resolve('work/st-review/data/default-user'),cookies=new Map();
+const capture=r=>{for(const c of r.headers.getSetCookie()){const [pair]=c.split(';'),at=pair.indexOf('=');cookies.set(pair.slice(0,at),pair.slice(at+1));}};
+const csrf=await fetch(host+'/csrf-token');capture(csrf);const {token}=await csrf.json();let client=randomUUID();
+async function call(route,data,method=data===undefined?'GET':'POST'){const r=await fetch(host+base+route,{method,headers:{'Content-Type':'application/json','X-CSRF-Token':token,'X-Chat-Tabs-Client':client,Cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')},body:data===undefined?undefined:JSON.stringify(data)});capture(r);return r;}
+async function json(route,data,method){const r=await call(route,data,method);const v=r.status===204?null:await r.json();assert.ok(r.ok,JSON.stringify(v));return v;}
+const empty=await call('/tabs',undefined,'POST');assert.equal(empty.status,201);const a=await empty.json();const b=await json('/tabs',{name:'1.6 同步验证'});
+await json('/tab/'+a.id+'/lease');assert.equal((await call('/tabs/'+a.id,undefined,'DELETE')).status,409);
+let overview=await json('/tabs/overview');assert.equal(overview.find(t=>t.id===a.id).open,true);assert.ok(overview.find(t=>t.id===a.id).lastOpened);
+await json('/tab/'+a.id+'/lease/release',{});
+const file=(t,n)=>path.join(root,'chat-tabs',t.id,n);const from=JSON.parse(fs.readFileSync(file(a,'settings.json'))),to=JSON.parse(fs.readFileSync(file(b,'settings.json')));
+from.extension_settings.apiHub={activeConnectionId:'a',connections:[{id:'a',name:'A',model:'model-a',secretId:'key-a'},{id:'b',name:'B',secretId:'key-b'}]};
+to.extension_settings.apiHub={activeConnectionId:'own',connections:[{id:'own',name:'Own',model:'keep'}]};
+fs.writeFileSync(file(a,'settings.json'),JSON.stringify(from));fs.writeFileSync(file(b,'settings.json'),JSON.stringify(to));
+fs.writeFileSync(file(a,'secrets.json'),JSON.stringify({api_key_custom:[{id:'key-a',value:'fixture-a',active:true},{id:'key-b',value:'fixture-b',active:false}]}));
+fs.writeFileSync(file(b,'secrets.json'),JSON.stringify({api_key_custom:[{id:'own',value:'fixture-own',active:true}]}));
+fs.writeFileSync(path.join(root,'OpenAI Settings','Chat Tabs practice.json'),JSON.stringify({temperature:0.6}));
+const catalog=await json('/tabs/sync/catalog?source='+a.id);assert.equal(catalog.connections.length,2);assert.equal(JSON.stringify(catalog).includes('fixture-a'),false);
+const selection={selectionVersion:2,source:a.id,target:b.id,categories:['api'],connections:['hub:a'],useActiveConnection:false};
+let plan=await json('/tabs/sync/plan',selection);await json('/tabs/sync',{...selection,revision:plan.revision});
+const settings=JSON.parse(fs.readFileSync(file(b,'settings.json'))),keys=JSON.parse(fs.readFileSync(file(b,'secrets.json')));
+assert.equal(settings.extension_settings.apiHub.activeConnectionId,'own');assert.deepEqual(keys.api_key_custom.map(k=>k.id),['own','key-a']);assert.equal(keys.api_key_custom[0].active,true);assert.equal(keys.api_key_custom[1].active,false);
+const other=catalog.presets.find(n=>n!==catalog.preset);assert.ok(other);
+const presetSelection={selectionVersion:2,source:a.id,target:b.id,categories:['presets'],preset:other,connections:[]};plan=await json('/tabs/sync/plan',presetSelection);await json('/tabs/sync',{...presetSelection,revision:plan.revision});
+assert.equal(JSON.parse(fs.readFileSync(file(b,'tab.json'))).pendingPreset,other);
+assert.equal((await call('/tabs/'+b.id+'/delete',{confirmation:'delete-archived'})).status,409);
+await call('/tabs/'+b.id,undefined,'DELETE');assert.equal((await call('/tabs/'+b.id+'/delete',{confirmation:'delete-archived'})).status,204);
+assert.equal(fs.existsSync(file(b,'settings.json')),false);
+console.log('PASS: empty body, opened-window archive rejection, lastOpened, selected connection/key merge, pending native preset and archived deletion.');

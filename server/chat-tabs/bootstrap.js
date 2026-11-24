@@ -46,10 +46,10 @@
         panel.setAttribute('role', 'alert');
         panel.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#202026f5;color:#fff;display:grid;place-content:center;gap:20px;padding:24px;text-align:center;';
         const message = document.createElement('p');
-        message.textContent = '这个已保存窗口正在另一页使用。要分开聊，请回主页面 → 魔术棒 → 多开聊天，新建独立窗口。若旧页已关闭，最多等 90 秒后刷新此页。';
+        message.textContent = '这个已保存窗口正在另一页使用。要分开聊，请回主窗口 → 魔棒 → 多开助手，新建独立窗口。若旧页已关闭，最多等 90 秒后刷新此页。';
         const link = document.createElement('a');
         link.href = '/';
-        link.textContent = '回到酒馆主页面';
+        link.textContent = '回到主窗口';
         link.style.color = '#a8d8ff';
         panel.append(message, link);
         (document.body || document.documentElement).append(panel);
@@ -82,13 +82,16 @@
         const target = request ? new Request(scoped, template.clone()) : scoped;
         let response = await fetchOriginal(target, { ...options, headers });
         // A normal refresh may reach the server just before the previous page releases its lease.
-        if (response.status === 409 && !blocked && (await response.clone().json().catch(() => null))?.code === 'WINDOW_IN_USE') {
+        const inUse = async result => result.status === 409 && (await result.clone().json().catch(() => null))?.code === 'WINDOW_IN_USE';
+        let conflict = !blocked && await inUse(response);
+        if (conflict) {
             for (let attempt = 0; attempt < 15; attempt++) {
                 await new Promise(resolve => setTimeout(resolve, 100));
                 response = await fetchOriginal(request ? new Request(scoped, template.clone()) : scoped, { ...options, headers });
-                if (response.status !== 409) break;
+                conflict = await inUse(response);
+                if (!conflict) break;
             }
-            if (response.status === 409) showBlocked();
+            if (conflict) showBlocked();
         }
         return response;
     };

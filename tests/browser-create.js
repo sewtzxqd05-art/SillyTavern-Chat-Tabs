@@ -1,0 +1,30 @@
+async page => {
+    if (!page.url().startsWith('http://127.0.0.1:18122/')) throw Error('Use the isolated review fixture.');
+    await page.goto('http://127.0.0.1:18122/');
+    await page.setViewportSize({ width: 1360, height: 960 });
+    await page.locator('#chat-tabs-wand-menu').waitFor({ state: 'attached' });
+    await page.waitForFunction(() => SillyTavern.getContext().characters.some(role => role.avatar === 'default_Seraphina.png'));
+    await page.locator('#extensionsMenuButton').click(); await page.locator('#chat-tabs-wand-menu').click();
+    await page.locator('.chat-tabs-window-row').first().waitFor();
+    await page.getByRole('button', {name:'＋ 新窗口',exact:true}).click();
+    await page.getByLabel('窗口名称（选填）', { exact: true }).fill('存档与新开窗口检查');
+    await page.getByLabel('角色', { exact: true }).selectOption('default_Seraphina.png');
+    let creates = 0;
+    page.on('request', request => { if (request.url().endsWith('/api/plugins/chat-tabs/tabs') && request.method() === 'POST') creates++; });
+    await page.route('**/api/settings/save', route => route.fulfill({ status: 503, json: { error: 'Synthetic settings save failure' } }));
+    const failedPopup = page.waitForEvent('popup');
+    await page.getByRole('button', { name: '创建并打开', exact: true }).click();
+    const failed = await failedPopup;
+    await page.getByRole('status').filter({ hasText: '本页设置尚未保存成功' }).waitFor();
+    if (creates !== 0 || !failed.isClosed()) throw Error('Failed settings save must neither create a window nor leave an empty popup.');
+    await page.unroute('**/api/settings/save');
+    const opened = page.waitForEvent('popup');
+    await page.getByRole('button', { name: '创建并打开', exact: true }).click();
+    const newPage = await opened;
+    await newPage.waitForURL('**/api/plugins/chat-tabs/tab/*');
+    await newPage.locator('#chat-tabs-wand-menu').waitFor({ state: 'attached' });
+    if (creates !== 1) throw Error('Successful creation should create exactly one window.');
+    const name = await newPage.title();
+    await newPage.close();
+    return { failedSaveCreates: 0, emptyPopupClosed: true, successfulCreates: creates, newWindowTitle: name };
+}

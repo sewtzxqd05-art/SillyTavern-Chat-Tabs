@@ -2,8 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
-import { router as completions } from '../../src/endpoints/backends/chat-completions.js';
-import { trySaveChat } from '../../src/endpoints/chats.js';
+import * as nativeCompletions from '../../src/endpoints/backends/chat-completions.js';
+const completions = nativeCompletions.router;
+import * as nativeChats from '../../src/endpoints/chats.js';
+const trySaveChat = nativeChats.trySaveChat;
+export const taskCompatibility = [typeof completions !== 'function' && '生成接口 router', typeof trySaveChat !== 'function' && '聊天保存 trySaveChat'].filter(Boolean);
+import { createTaskStore } from './task-store.mjs';
+import { summarizePendingTasks } from './task-overview.mjs';
 
 export const TASK_SOURCES = ['custom', 'openai', 'openrouter', 'deepseek', 'xai'];
 const ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
@@ -61,26 +66,25 @@ function runNative(user, body, socket) {
 }
 
 export function setupTasks(router, helpers) {
-    const { getTabRoot, ensureStorage, readJson, writeJson, claim, chatFile, validAvatar, validFile, readMeta } = helpers;
-    const fileFor = (root, id) => path.join(root, 'tasks', id + '.json');
+    const { getTabRoot, ensureStorage, readJson, writeJson, claim, chatFile, validAvatar, validFile, readMeta, windowBusy } = helpers;
+    const store = createTaskStore({ readJson, writeJson });
     function load(root, id) {
-        if (!ID.test(id || '') || !fs.existsSync(fileFor(root, id))) return null;
-        const task = readJson(fileFor(root, id));
+        if (!ID.test(id || '')) return null;
+        const task = store.read(root, id);
+        if (!task) return null;
         if (task.status === 'running' && active.get(root)?.task.id !== id) {
             task.status = 'interrupted';
             task.completed = Date.now();
             task.error = '酒馆后台曾重启或被终止，此请求未完成；不会自动重发。';
-            writeJson(fileFor(root, id), task);
+            store.write(root, task);
         }
         return task;
     }
     function list(root) {
-        const directory = path.join(root, 'tasks');
-        if (!fs.existsSync(directory)) return [];
-        return fs.readdirSync(directory).flatMap(file => {
-            try { const task = load(root, file.replace(/\.json$/, '')); return task ? [task] : []; }
-            catch { return []; }
-        }).sort((a, b) => b.created - a.created);
+        return store.list(root).map(task => task.status === 'running' ? load(root, task.id) : task);
+    }
+    function overview(root) {
+        return summarizePendingTasks(list(root));
     }
     function summary(task) {
         const { result, baseline, ...safe } = task;
@@ -110,13 +114,29 @@ export function setupTasks(router, helpers) {
             task.error = '后台生成未完成，请检查酒馆终端日志。不会自动重发。';
         } finally {
             task.completed = Date.now();
-            try { writeJson(fileFor(root, task.id), task); }
+            try { store.write(root, task); }
             catch (error) { console.error('[Chat Tabs] Failed to persist task result:', error.code || error.name); }
             if (active.get(root) === job) active.delete(root);
             job.socket.removeAllListeners();
         }
     }
 
+    router.post('/tabs/:id/tasks/:task/dismiss', (req, res) => {
+        const root = getTabRoot(req.user, req.params.id, true);
+        if (!root) return res.sendStatus(404);
+        if (windowBusy(root)) return res.status(409).json({ error: '窗口仍在使用，请到对应窗口处理这条回复。' });
+        const task = load(root, req.params.task);
+        if (!task) return res.sendStatus(404);
+        if (task.status === 'running') return res.sendStatus(409);
+        task.dismissed = true; store.write(root, task); res.json(summary(task));
+    });
+    router.get('/tabs/:id/tasks/:task/preview', (req, res) => {
+        const root = getTabRoot(req.user, req.params.id, true);
+        if (!root) return res.sendStatus(404);
+        const task = load(root, req.params.task);
+        if (!task || task.applied || task.dismissed) return res.sendStatus(404);
+        res.json({ id: task.id, text: textOf(task.result), status: task.status });
+    });
     router.get('/tab/:id/tasks', (req, res) => {
         const ctx = context(req, res);
         if (ctx) res.json(list(ctx.root).map(summary));
@@ -130,6 +150,7 @@ export function setupTasks(router, helpers) {
         res.json(safe);
     });
     router.post('/tab/:id/tasks', async (req, res) => {
+        if (taskCompatibility.length) return res.status(503).json({ error: '此酒馆版本的后台生成接口不兼容。' });
         const ctx = context(req, res);
         if (!ctx) return;
         const { root, dirs } = ctx;
@@ -158,7 +179,7 @@ export function setupTasks(router, helpers) {
             await trySaveChat(chat, file, false, req.user.profile.handle + '--chat-tabs-' + req.params.id, target.avatar.replace('.png', ''), dirs.backups);
             task.baseline = digest(file);
             fs.mkdirSync(path.join(root, 'tasks'), { recursive: true, mode: 0o700 });
-            writeJson(fileFor(root, id), task);
+            store.write(root, task);
             const user = { ...req.user, directories: { ...dirs }, profile: { ...req.user.profile } };
             res.status(202).json(summary(task));
             void execute(root, user, job, generation);
@@ -179,27 +200,33 @@ export function setupTasks(router, helpers) {
             if (job?.task.id === task.id) { job.cancelled = true; job.socket.close(); }
             return res.json({ ok: true });
         }
+        if ((task.applied || task.dismissed) && ['apply', 'ack', 'dismiss'].includes(action)) return res.json(summary(task));
         if (action === 'dismiss') {
             if (task.status === 'running') return res.status(409).json({ error: '请先停止后台任务。' });
             task.dismissed = true;
         } else if (action === 'apply' || action === 'ack') {
             if (action === 'apply' && active.has(root)) return res.status(409).json({ error: '请先等待或停止这个窗口的后台任务。' });
             if (task.status !== 'succeeded') return res.status(409).json({ error: '任务尚未成功完成。' });
-            const file = chatFile(dirs, task.target.avatar, task.target.chat);
-            const data = messages(file);
-            if (!data.some(message => message.extra?.chat_tabs_task === task.id)) {
-                if (action === 'ack') return res.status(409).json({ error: '回复尚未保存，暂存结果继续保留。' });
-                if (digest(file) !== task.baseline) return res.status(409).json({ error: '这段聊天已经修改，未自动写入。请查看暂存回复后手动复制，避免覆盖新剧情。' });
-                data.push({ name: task.target.name, is_user: false, is_system: false, mes: textOf(task.result), send_date: new Date(task.completed).toISOString(), gen_started: new Date(task.created).toISOString(), gen_finished: new Date(task.completed).toISOString(), extra: { api: 'openai', model: task.model, chat_tabs_task: task.id, reasoning: task.result.choices?.[0]?.message?.reasoning_content || '' } });
-                await trySaveChat(data, file, false, req.user.profile.handle + '--chat-tabs-' + req.params.id, task.target.avatar.replace('.png', ''), dirs.backups);
+            try {
+                const file = chatFile(dirs, task.target.avatar, task.target.chat);
+                const data = messages(file);
+                if (!data.some(message => message.extra?.chat_tabs_task === task.id)) {
+                    if (action === 'ack') return res.status(409).json({ error: '回复尚未保存，暂存结果继续保留。' });
+                    if (digest(file) !== task.baseline) return res.status(409).json({ error: '这段聊天已经修改，未自动写入。请查看暂存回复后手动复制，避免覆盖新剧情。' });
+                    data.push({ name: task.target.name, is_user: false, is_system: false, mes: textOf(task.result), send_date: new Date(task.completed).toISOString(), gen_started: new Date(task.created).toISOString(), gen_finished: new Date(task.completed).toISOString(), extra: { api: 'openai', model: task.model, chat_tabs_task: task.id, reasoning: task.result.choices?.[0]?.message?.reasoning_content || '' } });
+                    await trySaveChat(data, file, false, req.user.profile.handle + '--chat-tabs-' + req.params.id, task.target.avatar.replace('.png', ''), dirs.backups);
+                }
+            } catch {
+                return res.status(409).json({ error: '回复未能保存，暂存结果仍保留。请检查聊天文件与磁盘空间后重试，或查看并复制回复。' });
             }
             task.applied = true;
         } else return res.sendStatus(404);
-        writeJson(fileFor(root, task.id), task);
+        store.write(root, task);
         res.json(summary(task));
     });
     return {
         busy: root => active.has(root),
+        overview,
         blocksWrite(root, route, body) {
             const job = active.get(root);
             if (!job || !route.startsWith('/api/chats/')) return false;

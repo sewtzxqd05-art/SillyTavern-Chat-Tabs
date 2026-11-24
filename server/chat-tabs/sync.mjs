@@ -196,6 +196,63 @@ export function mergeSettings(source, destination, categories) {
     return result;
 }
 
+// Explicit selections use merge semantics; legacy callers retain their category contract.
+export function selectedConnections(settings) {
+    const ext = settings.extension_settings || {};
+    return [...(ext.apiHub?.connections || []).map(c => ({ ...c, key: 'hub:' + c.id, kind: 'hub' })),
+        ...(ext.connectionManager?.profiles || []).map(c => ({ ...c, key: 'profile:' + c.id, kind: 'profile' }))];
+}
+export function mergeSelection(source, target, secrets, targetSecrets, categories, options) {
+    const result = mergeSettings(source, target, categories.filter(c => c !== 'api' && c !== 'presets'));
+    const keys = structuredClone(targetSecrets);
+    if (categories.includes('presets')) {
+        result.oai_settings ||= {};
+        if (options.preset === source.oai_settings?.preset_settings_openai) copyKeys(result.oai_settings, source.oai_settings, OAI_PRESETS);
+        else result.oai_settings.preset_settings_openai = options.preset;
+    }
+    if (categories.includes('api')) {
+        const chosen = selectedConnections(source).filter(c => options.connections.includes(c.key));
+        result.extension_settings ||= {};
+        for (const kind of ['hub', 'profile']) {
+            const property = kind === 'hub' ? 'apiHub' : 'connectionManager', list = kind === 'hub' ? 'connections' : 'profiles';
+            const items = chosen.filter(c => c.kind === kind);
+            if (!items.length) continue;
+            const dest = result.extension_settings[property] ||= {};
+            dest[list] = Array.isArray(dest[list]) ? dest[list] : [];
+            for (const c of items) {
+                const old = dest[list].find(x => x.id === c.id), value = {};
+                copyKeys(value, c, kind === 'hub' ? [...HUB_API, 'promptPostProcessing'] : PROFILE_API);
+                if (old) copyKeys(value, old, kind === 'hub' ? HUB_PRESETS : PROFILE_PRESETS);
+                const index = dest[list].findIndex(x => x.id === c.id);
+                if (index < 0) dest[list].push(value); else dest[list][index] = value;
+                const secretId = c.secretId || c['secret-id'];
+                for (const type of CONVERSATION_SECRETS) {
+                    const incoming = Array.isArray(secrets[type]) ? secrets[type].find(k => k.id === secretId) : null;
+                    if (!incoming) continue;
+                    keys[type] = Array.isArray(keys[type]) ? keys[type] : [];
+                    const existing = keys[type].findIndex(k => k.id === incoming.id);
+                    const secret = { ...incoming, active: existing >= 0 ? keys[type][existing].active : false };
+                    if (existing < 0) keys[type].push(secret); else keys[type][existing] = secret;
+                }
+            }
+        }
+        if (result.extension_settings.apiHub) result.extension_settings.apiHub.linkPresetsOnConnectionSwitch = false;
+        if (options.useActiveConnection) {
+            section(result, source, 'oai_settings', OAI_API); copyKeys(result, source, ['main_api']);
+            for (const [property, key] of [['apiHub', 'activeConnectionId'], ['connectionManager', 'selectedProfile']]) {
+                const active = source.extension_settings?.[property]?.[key];
+                if (active && result.extension_settings[property] && chosen.some(c => c.id === active && c.kind === (property === 'apiHub' ? 'hub' : 'profile'))) result.extension_settings[property][key] = active;
+            }
+            const activeIds = new Set(chosen.map(c => c.secretId || c['secret-id']).filter(Boolean));
+            for (const type of CONVERSATION_SECRETS) {
+                const active = secrets[type]?.find?.(k => k.active && activeIds.has(k.id));
+                if (active && Array.isArray(keys[type])) keys[type] = keys[type].map(k => ({ ...k, active: k.id === active.id }));
+            }
+        }
+    }
+    return { settings: result, secrets: keys };
+}
+
 // A durable, private roll-forward journal makes settings + credentials one recoverable
 // operation. A process exit between the two writes is completed before a window opens.
 export function recoverSync(root) {
@@ -238,8 +295,20 @@ export function setupSync(router, { getTabRoot, busy, guardSettings }) {
                 return stat.isFile() ? [[name, stat.size, stat.mtimeMs, stat.ctimeMs]] : [];
             });
         }
-        const revision = createHmac('sha256', revisionKey).update(JSON.stringify({ source, target, categories, from, to, cards })).digest('hex');
-        return { source, target, categories, from, to, cards, targetRoot, revision };
+        const options = body.selectionVersion === 2 ? { preset: body.preset, connections: body.connections || [], useActiveConnection: !!body.useActiveConnection } : null;
+        if (options) {
+            if (!Array.isArray(options.connections) || options.connections.some(id => !selectedConnections(from.settings.value).some(c => c.key === id))) return { status: 400, error: '连接选择已经变化，请重新选择。' };
+            if (categories.includes('presets') && (typeof options.preset !== 'string' || !options.preset || options.preset.includes('/') || options.preset.includes('\\') || options.preset === '..')) return { status: 400, error: '请选择预设。' };
+            if (categories.includes('presets') && options.preset !== from.settings.value.oai_settings?.preset_settings_openai
+                && !fs.lstatSync(path.join(user.directories.openAI_Settings, options.preset + '.json'), { throwIfNoEntry: false })?.isFile()) return { status: 400, error: '预设文件不存在。' };
+            if (options.useActiveConnection) {
+                const ext = from.settings.value.extension_settings || {};
+                const required = [ext.apiHub?.activeConnectionId && 'hub:' + ext.apiHub.activeConnectionId, ext.connectionManager?.selectedProfile && 'profile:' + ext.connectionManager.selectedProfile].filter(Boolean);
+                if (!required.length || required.some(id => !options.connections.includes(id))) return { status: 400, error: '请同时勾选来源正在使用的连接。' };
+            }
+        }
+        const revision = createHmac('sha256', revisionKey).update(JSON.stringify({ source, target, categories, from, to, cards, options })).digest('hex');
+        return { source, target, categories, from, to, cards, targetRoot, revision, options };
     }
     function check(req, res) {
         try {
@@ -251,6 +320,19 @@ export function setupSync(router, { getTabRoot, busy, guardSettings }) {
             return null;
         }
     }
+    router.get('/tabs/sync/catalog', (req, res) => {
+        try {
+            const source = req.query.source || 'main';
+            const root = source === 'main' ? req.user.directories.root : getTabRoot(req.user, source);
+            if (!root) return res.sendStatus(404);
+            const settings = jsonFile(path.join(root, 'settings.json')).value;
+            const ext = settings.extension_settings || {};
+            res.json({ preset: settings.oai_settings?.preset_settings_openai || '', theme: settings.power_user?.theme || '',
+                presets: fs.readdirSync(req.user.directories.openAI_Settings).filter(n => n.endsWith('.json')).map(n => n.slice(0, -5)),
+                connections: selectedConnections(settings).map(c => ({ key: c.key, name: c.name || c.id, model: c.model || '', endpoint: c.endpoint || c['api-url'] || '', format: c.format || c.api || '', hasSecret: !!(c.secretId || c['secret-id'] || c.apiKey),
+                    active: c.kind === 'hub' ? c.id === ext.apiHub?.activeConnectionId : c.id === ext.connectionManager?.selectedProfile })) });
+        } catch { res.status(409).json({ error: '无法读取同步资料。' }); }
+    });
     router.post('/tabs/sync/plan', (req, res) => {
         const state = check(req, res);
         if (!state) return;
@@ -263,15 +345,20 @@ export function setupSync(router, { getTabRoot, busy, guardSettings }) {
         if (req.body.revision !== state.revision) return res.status(409).json({ error: '来源或目标的已保存资料已经变化，未执行同步。请核对选择后重新点击同步。' });
         const { from, to, categories, source, targetRoot } = state;
         const files = {};
+        const selected = state.options ? mergeSelection(from.settings.value, to.settings.value, from.secrets.value, to.secrets.value, categories, state.options) : null;
         if (categories.includes('api')) {
             const secrets = structuredClone(to.secrets.value);
-            copyKeys(secrets, from.secrets.value, CONVERSATION_SECRETS);
-            files['secrets.json'] = JSON.stringify(secrets, null, 2);
+            if (!selected) copyKeys(secrets, from.secrets.value, CONVERSATION_SECRETS);
+            files['secrets.json'] = JSON.stringify(selected?.secrets || secrets, null, 2);
         }
         if (categories.some(category => category !== 'characters')) {
-            files['settings.json'] = JSON.stringify(guardSettings(mergeSettings(from.settings.value, to.settings.value, categories)), null, 2);
+            files['settings.json'] = JSON.stringify(guardSettings(selected?.settings || mergeSettings(from.settings.value, to.settings.value, categories)), null, 2);
         }
         const meta = structuredClone(to.meta.value);
+        if (state.options && categories.includes('presets')) {
+            if (state.options.preset !== from.settings.value.oai_settings?.preset_settings_openai) meta.pendingPreset = state.options.preset;
+            else delete meta.pendingPreset;
+        }
         meta.lastSync = { at: Date.now(), source, categories };
         files['tab.json'] = JSON.stringify(meta, null, 2);
         try {

@@ -1,0 +1,11 @@
+{
+  "name": "sillytavern-chat-tabs",
+  "version": "1.6.0-beta.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:fixture": "node tests/prepare-fixture.mjs",
+    "test:integration": "node tests/integration.mjs"
+  }
+}

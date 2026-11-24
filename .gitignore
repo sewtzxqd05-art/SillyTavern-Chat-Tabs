@@ -11,3 +11,6 @@ work/
 outputs/
 .DS_Store
 Thumbs.db
+.playwright-cli/
+
+output/

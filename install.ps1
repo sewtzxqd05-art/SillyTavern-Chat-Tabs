@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$TavernPath = 'D:\SillyTavern',
     [switch]$FrontendOnly,
     [switch]$BackendOnly,
@@ -38,6 +38,28 @@ $stCopies = @(
 )
 if ($FrontendOnly) { $stCopies = @($stCopies | Where-Object { $_.Backup -eq 'frontend' }) }
 if ($BackendOnly) { $stCopies = @($stCopies | Where-Object { $_.Backup -eq 'server' }) }
+if (-not $BackendOnly) {
+    $stCandidates = @((Join-Path $stInstallRoot 'public/scripts/extensions/third-party/SillyTavern-Chat-Tabs'))
+    $stData = Join-Path $stInstallRoot 'data'
+    if (Test-Path -LiteralPath $stData) {
+        foreach ($stUser in Get-ChildItem -LiteralPath $stData -Directory) {
+            foreach ($stName in @('chat-tabs', 'SillyTavern-Chat-Tabs', 'third-party/chat-tabs', 'third-party/SillyTavern-Chat-Tabs')) {
+                $stCandidates += Join-Path $stUser.FullName ('extensions/' + $stName)
+            }
+        }
+    }
+    foreach ($stCandidate in $stCandidates) {
+        if (Test-Path -LiteralPath $stCandidate) { throw ('Another Chat Tabs installation exists. Keep one frontend installation before continuing: ' + $stCandidate) }
+    }
+}
+foreach ($stCopy in $stCopies) {
+    $stSource = Join-Path $stSourceRoot $stCopy.Source
+    if (-not (Test-Path -LiteralPath $stSource -PathType Container)) { throw ('Installation source missing: ' + $stSource) }
+    $stTarget = [System.IO.Path]::GetFullPath((Join-Path $stInstallRoot $stCopy.Target))
+    if ($stSourceRoot -eq $stTarget -or $stSourceRoot.StartsWith($stTarget + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Run the installer from a separate extracted package, outside the plugin destination.'
+    }
+}
 $stBackupRoot = Join-Path $stInstallRoot ('.chat-tabs-backups/' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 foreach ($stCopy in $stCopies) {
     $stDestination = Join-Path $stInstallRoot $stCopy.Target
@@ -47,7 +69,12 @@ foreach ($stCopy in $stCopies) {
             throw ('Refusing to overwrite a link: ' + $stDestination)
         }
         New-Item -ItemType Directory -Path $stBackupRoot -Force | Out-Null
-        Copy-Item -LiteralPath $stDestination -Destination (Join-Path $stBackupRoot $stCopy.Backup) -Recurse
+        $stResolved = (Resolve-Path -LiteralPath $stDestination).ProviderPath
+        $stExpected = [System.IO.Path]::GetFullPath((Join-Path $stInstallRoot $stCopy.Target))
+        if ($stResolved -ne $stExpected -or -not $stResolved.StartsWith($stInstallRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ('Refusing unexpected installation path: ' + $stResolved)
+        }
+        Move-Item -LiteralPath $stResolved -Destination (Join-Path $stBackupRoot $stCopy.Backup)
     }
 }
 foreach ($stCopy in $stCopies) {
@@ -60,6 +87,6 @@ foreach ($stCopy in $stCopies) {
 }
 Write-Output ('SillyTavern version: ' + $stPackage.version)
 if ($FrontendOnly) { Write-Output 'Frontend installed. Refresh the page. Audio and screen wake lock are available without the server plugin.' }
-elseif ($BackendOnly) { Write-Output 'Chat Tabs 1.3.0 companion installed. Restart SillyTavern and refresh all pages.' }
-else { Write-Output 'Chat Tabs 1.3.0 installed. Restart SillyTavern and refresh all pages. Open the magic wand menu > Multi-chat.' }
+elseif ($BackendOnly) { Write-Output 'Chat Tabs 1.6.0-beta.1 companion installed. Restart SillyTavern and refresh all pages.' }
+else { Write-Output 'Chat Tabs 1.6.0-beta.1 installed. Restart SillyTavern and refresh all pages. Open the magic wand menu > Multi-chat.' }
 if (Test-Path -LiteralPath $stBackupRoot) { Write-Output ('Previous plugin files backed up to: ' + $stBackupRoot) }
